@@ -28,14 +28,18 @@ class ReflexionEngine:
         Output ONLY the rule. No explanations. Max 2 sentences."""
         
         user_prompt = f"Task Attempted: '{task_description}'\nFailure Reason: '{failure_reason}'\nExtract the corrective rule:"
-        
         rule = self._generate_completion(system_prompt, user_prompt, temperature=0.1)
-        self.repo.store_rule(rule_text=rule, task=task_description, failure=failure_reason)
+        
+        # NEW: Extract Concept Category for Graph DB
+        concept_prompt = f"Categorize this rule into a single, uppercase concept node (e.g., HTTP_REQUEST_BEST_PRACTICES, ERROR_HANDLING, SECURITY).\nRule: '{rule}'\nOutput ONLY the category name:"
+        concept = self._generate_completion("You are a categorizer.", concept_prompt, temperature=0.0).replace(" ", "_").upper()
+        
+        # Store rule with its concept
+        self.repo.store_rule(rule_text=rule, task=task_description, failure=failure_reason, concept=concept)
         self.logger.log_rule(task_description, failure_reason, rule)
         return rule
 
     def get_relevant_rules_prompt(self, task_description: str):
-        """Returns a dict containing the prompt string AND the rule IDs for later reinforcement."""
         rules = self.repo.retrieve_rules(task_description)
         if not rules:
             return {"prompt": "No prior rules learned.", "rule_ids": []}
@@ -46,7 +50,6 @@ class ReflexionEngine:
         return {"prompt": prompt, "rule_ids": rule_ids}
 
     def reinforce_rules(self, rule_ids: list, success: bool = True):
-        """Rule Decay: If rule helped, +1 confidence. If it failed, -1 confidence."""
         delta = 1 if success else -1
         for rid in rule_ids:
             self.repo.adjust_confidence(rid, delta)
