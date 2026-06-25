@@ -88,7 +88,7 @@ Or check health:
 
     python -m pytest tests/ -v
 
-All 14 tests should pass.
+All 24 tests should pass.
 
 ## API Usage
 
