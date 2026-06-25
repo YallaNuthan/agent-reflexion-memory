@@ -1,8 +1,8 @@
-# agent-reflexion-memory-v2
+# agent-reflexion-memory
 
 > A production-grade, Graph-Vector Hybrid memory microservice for autonomous AI agents. Stop feeding your agents massive conversation logs. Teach them dense, actionable rules.
 
-[![CI](https://github.com/YallaNuthan/agent-reflexion-memory-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/YallaNuthan/agent-reflexion-memory-v2/actions/workflows/ci.yml)
+[![CI](https://github.com/YallaNuthan/agent-reflexion-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/YallaNuthan/agent-reflexion-memory/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
@@ -44,8 +44,8 @@ Instead of saving logs, this microservice uses a Reflexion Loop:
 
 ### 1. Clone the repository
 
-    git clone https://github.com/YallaNuthan/agent-reflexion-memory-v2.git
-    cd agent-reflexion-memory-v2
+    git clone https://github.com/YallaNuthan/agent-reflexion-memory.git
+    cd agent-reflexion-memory
 
 ### 2. Set up your environment
 

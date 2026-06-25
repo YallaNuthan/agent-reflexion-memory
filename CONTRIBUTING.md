@@ -7,7 +7,7 @@ mechanisms for autonomous AI agent memory — please read below before submittin
 
 ## Before You Start
 
-- Check existing [Issues](https://github.com/YallaNuthan/agent-reflexion-memory-v2/issues) to avoid duplicates
+- Check existing [Issues](https://github.com/YallaNuthan/agent-reflexion-memory/issues) to avoid duplicates
 - For large changes, open an issue first to discuss the approach
 - All PRs must pass the CI pipeline (14 tests) before review
 
@@ -16,8 +16,8 @@ mechanisms for autonomous AI agent memory — please read below before submittin
 ## Setup
 
 \`\`\`bash
-git clone https://github.com/YallaNuthan/agent-reflexion-memory-v2.git
-cd agent-reflexion-memory-v2
+git clone https://github.com/YallaNuthan/agent-reflexion-memory.git
+cd agent-reflexion-memory
 python -m venv myenv
 myenv\Scripts\activate        # Windows
 pip install -r requirements.txt
