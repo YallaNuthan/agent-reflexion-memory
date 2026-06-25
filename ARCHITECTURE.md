@@ -1,4 +1,5 @@
 # Architecture
+![Agent Reflexion Memory architecture diagram](docs/architecture-diagram.svg)
 
 Agent Reflexion Memory is a **Graph-Vector Hybrid memory microservice** for autonomous AI agents. Instead of storing raw conversation logs, it distills failures into dense, reusable behavioral rules.
 

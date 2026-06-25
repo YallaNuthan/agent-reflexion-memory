@@ -27,6 +27,7 @@ Instead of saving logs, this microservice uses a Reflexion Loop:
 5. **Retrieve:** Before any new task, the agent retrieves the top relevant rules — including inherited rules from parent concepts — saving the bulk of context tokens.
 
 ## Architecture
+![Agent Reflexion Memory architecture diagram](docs/architecture-diagram.svg)
 
 - **Graph-Vector Hybrid:** ChromaDB for semantic search, Neo4j for conceptual hierarchies.
 - **Multi-Tenancy:** Pass an `agent_id` to give every distinct agent its own isolated memory namespace.
