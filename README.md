@@ -164,6 +164,15 @@ All endpoints (except `/health`) require an `X-API-Key` header matching your `AP
 - **GitHub Actions** — CI pipeline running on every push/PR
 - **Docker / Docker Compose** — containerized deployment
 
+## Benchmark Results
+
+Agent Reflexion Memory achieves **37–54% token savings** vs raw-log memory (Mem0-style),
+with all 3 novel mechanisms verified live against real Neo4j + ChromaDB.
+
+See [benchmarks/RESULTS.md](benchmarks/RESULTS.md) for the full breakdown including NOVEL-1
+hierarchy retrieval, NOVEL-2 cross-agent reinforcement, and NOVEL-3 temporal decay
+verification.
+
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup details, coding guidelines, and how the three novel mechanisms (NOVEL-1, NOVEL-2, NOVEL-3) are protected from breaking changes.
@@ -171,3 +180,4 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup deta
 ## Credits
 
 Built by [YallaNuthan](https://github.com/YallaNuthan).
+
