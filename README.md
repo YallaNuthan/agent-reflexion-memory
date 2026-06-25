@@ -160,7 +160,7 @@ All endpoints (except `/health`) require an `X-API-Key` header matching your `AP
 - **Neo4j** — concept graph + hierarchy traversal
 - **Groq (Llama)** — LLM-powered rule distillation and concept categorization
 - **APScheduler** — autonomous temporal decay job
-- **pytest** — 14-test suite covering all endpoints, auth, and error sanitization
+- **pytest** — 24-test suite covering all endpoints, auth, error sanitization, hierarchy cycle protection, and atomic confidence updates
 - **GitHub Actions** — CI pipeline running on every push/PR
 - **Docker / Docker Compose** — containerized deployment
 
@@ -180,4 +180,3 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup deta
 ## Credits
 
 Built by [YallaNuthan](https://github.com/YallaNuthan).
-
