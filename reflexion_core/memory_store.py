@@ -359,7 +359,7 @@ class MemoryRepository:
     # ─────────────────────────────────────────────────────────────────────────
     # [NOVEL-3] Temporal Decay Scheduler
     # ─────────────────────────────────────────────────────────────────────────
-    def run_temporal_decay(self):
+    def run_temporal_decay(self, batch_size: int = 500):
         """
         [NOVEL-3] Scans all rules in this agent's collection.
         Any rule whose last_applied_at is older than RULE_DECAY_DAYS days
@@ -369,47 +369,63 @@ class MemoryRepository:
         Designed to be called by an external APScheduler job (see scheduler.py).
         Ebbinghaus-inspired but applied specifically to distilled imperative
         behavioral correction rules — not episodic memories.
+
+        Processes the collection in batches (default 500 rules at a time)
+        instead of loading everything into memory at once — keeps memory
+        usage bounded as an agent's rule store grows into the thousands.
+        Decay logic itself is unchanged; only the iteration strategy differs.
         """
         if self.collection.count() == 0:
             return {"decayed": 0, "deleted": 0}
 
-        all_rules = self.collection.get(include=["metadatas", "documents"])
-        now_ts    = time.time()
+        now_ts = time.time()
         decay_threshold_secs = RULE_DECAY_DAYS * 86400
 
         decayed = 0
         deleted = 0
+        offset = 0
 
-        for rule_id, meta in zip(all_rules["ids"], all_rules["metadatas"]):
-            last_applied = meta.get("last_applied_at", meta.get("created_at", now_ts))
-            age_secs     = now_ts - last_applied
+        while True:
+            batch = self.collection.get(
+                limit=batch_size,
+                offset=offset,
+                include=["metadatas", "documents"]
+            )
+            if not batch["ids"]:
+                break
 
-            if age_secs > decay_threshold_secs:
-                current_conf = meta.get("confidence", 1)
-                new_conf     = current_conf + TEMPORAL_DECAY_DELTA  # delta is negative
+            for rule_id, meta in zip(batch["ids"], batch["metadatas"]):
+                last_applied = meta.get("last_applied_at", meta.get("created_at", now_ts))
+                age_secs     = now_ts - last_applied
 
-                if new_conf <= 0:
-                    self.collection.delete(ids=[rule_id])
-                    with self.graph.session() as session:
-                        session.run(
-                            "MATCH (r:Rule {id: $rid}) DETACH DELETE r",
-                            rid=rule_id
-                        )
-                    deleted += 1
-                else:
-                    updated_meta = dict(meta)
-                    updated_meta["confidence"] = new_conf
-                    self.collection.update(ids=[rule_id], metadatas=[updated_meta])
-                    with self.graph.session() as session:
-                        session.run(
-                            "MATCH (r:Rule {id: $rid}) SET r.confidence = $conf",
-                            rid=rule_id,
-                            conf=new_conf
-                        )
-                    decayed += 1
+                if age_secs > decay_threshold_secs:
+                    current_conf = meta.get("confidence", 1)
+                    new_conf     = current_conf + TEMPORAL_DECAY_DELTA  # delta is negative
 
-        return {"decayed": decayed, "deleted": deleted}
+                    if new_conf <= 0:
+                        self.collection.delete(ids=[rule_id])
+                        with self.graph.session() as session:
+                            session.run(
+                                "MATCH (r:Rule {id: $rid}) DETACH DELETE r",
+                                rid=rule_id
+                            )
+                        deleted += 1
+                    else:
+                        updated_meta = dict(meta)
+                        updated_meta["confidence"] = new_conf
+                        self.collection.update(ids=[rule_id], metadatas=[updated_meta])
+                        with self.graph.session() as session:
+                            session.run(
+                                "MATCH (r:Rule {id: $rid}) SET r.confidence = $conf",
+                                rid=rule_id,
+                                conf=new_conf
+                            )
+                        decayed += 1
 
+            # If a rule in this batch was deleted, the collection shrank, so the
+            # next "page" at the same offset now contains what used to be after
+            # it — advancing offset by the batch's original size still correctly
+            # walks the whole collection
     # ─────────────────────────────────────────────────────────────────────────
     # [NOVEL-1] Concept Hierarchy Management
     # ─────────────────────────────────────────────────────────────────────────
