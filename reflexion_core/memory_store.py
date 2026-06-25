@@ -34,9 +34,10 @@ from neo4j import GraphDatabase
 from .config import settings
 
 
-CROSS_AGENT_SIMILARITY_THRESHOLD = 0.85   # [NOVEL-2] cosine similarity gate
-RULE_DECAY_DAYS = 7                        # [NOVEL-3] days before temporal decay kicks in
-TEMPORAL_DECAY_DELTA = -1                  # [NOVEL-3] confidence decrement per stale period
+# [NOVEL-2]/[NOVEL-3] thresholds now sourced from settings (configurable via .env)
+CROSS_AGENT_SIMILARITY_THRESHOLD = settings.cross_agent_similarity_threshold
+RULE_DECAY_DAYS = settings.rule_decay_days
+TEMPORAL_DECAY_DELTA = -1   # confidence decrement per stale period
 
 
 class MemoryRepository:
@@ -155,6 +156,14 @@ class MemoryRepository:
         # Step 1 — semantic search for closest concept
         results = self.collection.query(query_texts=[query_text], n_results=1)
         if not results["documents"][0]:
+            return []
+
+        # Relevance floor: if even the closest match is too far away,
+        # the agent has no concept relevant to this query — return nothing
+        # rather than surfacing an unrelated concept's rules. [NOVEL-1 guard]
+        closest_distance = results["distances"][0][0]
+        MAX_RELEVANT_DISTANCE = 1.2
+        if closest_distance > MAX_RELEVANT_DISTANCE:
             return []
 
         primary_concept = results["metadatas"][0][0].get("concept", "UNKNOWN")
