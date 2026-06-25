@@ -162,6 +162,8 @@ def link_concept(request: LinkConceptRequest):
     try:
         repo.link_concept_parent(request.child_concept, request.parent_concept)
         return {"status": "success", "message": f"Linked '{request.child_concept}' → parent '{request.parent_concept}'"}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception:
         logger.exception("Error in /v1/concepts/link for agent_id=%s", request.agent_id)
         raise HTTPException(status_code=500, detail="Internal server error. Check server logs.")

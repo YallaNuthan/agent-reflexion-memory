@@ -309,23 +309,33 @@ class MemoryRepository:
                 cosine_similarity = 1.0 - (distances[0] / 2.0)
 
                 if cosine_similarity >= CROSS_AGENT_SIMILARITY_THRESHOLD:
-                    matched_rule_id   = peer_results["ids"][0][0]
-                    matched_meta      = peer_results["metadatas"][0][0]
-                    current_conf      = matched_meta.get("confidence", 1)
-                    new_conf          = current_conf + 1
+                    matched_rule_id = peer_results["ids"][0][0]
+                    matched_meta    = peer_results["metadatas"][0][0]
 
-                    # Reinforce confidence in peer's ChromaDB
+                    # Neo4j: atomic increment (r.confidence + 1 evaluated server-side
+                    # in a single write transaction) — avoids the lost-update race
+                    # a read-modify-write from Python would otherwise have under
+                    # concurrent reinforcement events.
+                    with self.graph.session() as session:
+                        neo4j_result = session.run(
+                            """
+                            MATCH (r:Rule {id: $rid})
+                            SET r.confidence = r.confidence + 1
+                            RETURN r.confidence AS new_confidence
+                            """,
+                            rid=matched_rule_id
+                        )
+                        record = neo4j_result.single()
+                        new_conf = record["new_confidence"] if record else matched_meta.get("confidence", 1) + 1
+
+                    # ChromaDB has no native atomic increment, so this side still
+                    # does a read-then-write — but we sync FROM Neo4j's authoritative
+                    # post-increment value rather than recomputing independently,
+                    # keeping the two stores converging on the same number even
+                    # under light concurrency.
                     updated_meta = dict(matched_meta)
                     updated_meta["confidence"] = new_conf
                     peer_collection.update(ids=[matched_rule_id], metadatas=[updated_meta])
-
-                    # Reinforce confidence in Neo4j too (dual-DB atomic sync)
-                    with self.graph.session() as session:
-                        session.run(
-                            "MATCH (r:Rule {id: $rid}) SET r.confidence = $conf",
-                            rid=matched_rule_id,
-                            conf=new_conf
-                        )
 
             except Exception:
                 # Never let cross-agent logic break the primary store_rule flow
@@ -392,8 +402,35 @@ class MemoryRepository:
         """
         [NOVEL-1] Explicitly sets a PARENT_CONCEPT edge between two concept nodes
         in the graph for this agent. Enables hierarchical inheritance during retrieval.
+
+        Raises ValueError if this would create a cycle (e.g. linking A under B
+        when B is already a descendant of A) — a cycle wouldn't infinite-loop
+        retrieval (traversal is capped at 2 hops) but would produce a nonsensical
+        hierarchy where a concept inherits from its own descendant.
         """
+        if child_concept == parent_concept:
+            raise ValueError("A concept cannot be its own parent.")
+
         with self.graph.session() as session:
+            # If parent_concept is already a descendant of child_concept,
+            # adding child -> parent here would close a cycle.
+            cycle_check = session.run(
+                """
+                MATCH (p:Concept {name: $parent_concept, agent_id: $agent_id})
+                      -[:PARENT_CONCEPT*1..10]->(c:Concept {name: $child_concept, agent_id: $agent_id})
+                RETURN count(*) AS path_count
+                """,
+                parent_concept=parent_concept,
+                child_concept=child_concept,
+                agent_id=self.agent_id
+            )
+            if cycle_check.single()["path_count"] > 0:
+                raise ValueError(
+                    f"Cannot link '{child_concept}' under '{parent_concept}': "
+                    f"'{parent_concept}' is already a descendant of '{child_concept}', "
+                    f"which would create a cycle."
+                )
+
             session.run(
                 """
                 MERGE (parent:Concept {name: $parent_concept, agent_id: $agent_id})
@@ -416,3 +453,4 @@ class MemoryRepository:
                 agent_id=self.agent_id
             )
             return [{"child": r["child"], "parent": r["parent"]} for r in results]
+        
