@@ -219,14 +219,39 @@ class MemoryRepository:
         Adjusts confidence score in both DBs.
         [NOVEL-3] Updates last_applied_at to NOW so temporal decay clock resets.
         Deletes rule atomically from both DBs if confidence hits zero.
+
+        The increment AND the zero-check both happen server-side in a single
+        Neo4j write (SET r.confidence = r.confidence + $delta ... RETURN),
+        so concurrent calls can't race on a stale Python-side confidence read
+        the way a read-modify-write would. ChromaDB has no atomic increment,
+        so it's still synced from Neo4j's authoritative post-write value.
         """
         current_data = self.collection.get(ids=[rule_id])
         if not current_data["metadatas"]:
             return
 
         now_ts = time.time()
-        current_confidence = current_data["metadatas"][0].get("confidence", 0)
-        new_confidence = current_confidence + delta
+
+        with self.graph.session() as session:
+            result = session.run(
+                """
+                MATCH (r:Rule {id: $rule_id})
+                SET r.confidence = r.confidence + $delta,
+                    r.last_applied_at = $now_ts
+                RETURN r.confidence AS new_confidence
+                """,
+                rule_id=rule_id,
+                delta=delta,
+                now_ts=now_ts
+            )
+            record = result.single()
+
+        if record is None:
+            # Rule didn't exist in Neo4j (shouldn't normally happen if it's
+            # in ChromaDB, but guard against drift between the two stores).
+            return
+
+        new_confidence = record["new_confidence"]
 
         if new_confidence <= 0:
             # Atomic delete from both stores
@@ -241,16 +266,6 @@ class MemoryRepository:
             updated_meta["confidence"] = new_confidence
             updated_meta["last_applied_at"] = now_ts   # [NOVEL-3] reset decay clock
             self.collection.update(ids=[rule_id], metadatas=[updated_meta])
-            with self.graph.session() as session:
-                session.run(
-                    """
-                    MATCH (r:Rule {id: $rule_id})
-                    SET r.confidence = $new_conf, r.last_applied_at = $now_ts
-                    """,
-                    rule_id=rule_id,
-                    new_conf=new_confidence,
-                    now_ts=now_ts
-                )
 
     # ─────────────────────────────────────────────────────────────────────────
     # [NOVEL-2] Cross-Agent Confidence Reinforcement

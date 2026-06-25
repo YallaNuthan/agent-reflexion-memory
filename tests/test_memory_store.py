@@ -284,3 +284,145 @@ def test_cross_agent_reinforce_uses_atomic_neo4j_increment(
     update_kwargs = mock_peer_collection.update.call_args
     updated_metadata = update_kwargs.kwargs["metadatas"][0]
     assert updated_metadata["confidence"] == 4
+    
+    
+    
+# ── Test 6: adjust_confidence atomic increment + zero-confidence deletion ───
+
+@patch("reflexion_core.memory_store.GraphDatabase")
+@patch("reflexion_core.memory_store.embedding_functions")
+@patch("reflexion_core.memory_store.chromadb")
+def test_adjust_confidence_uses_atomic_neo4j_increment(
+    mock_chromadb, mock_embedding_functions, mock_graphdb
+):
+    """
+    Guards against regressing to a read-modify-write pattern. The Neo4j query
+    must compute 'r.confidence + $delta' server-side and return the new value
+    — not read a Python-side confidence value and SET a precomputed result.
+    """
+    mock_collection = MagicMock()
+    mock_collection.get.return_value = {
+        "ids": ["rule_1"],
+        "metadatas": [{"confidence": 3, "concept": "HTTP_REQUEST_BEST_PRACTICES"}],
+    }
+    mock_client = MagicMock()
+    mock_client.get_or_create_collection.return_value = mock_collection
+    mock_chromadb.PersistentClient.return_value = mock_client
+
+    mock_session = MagicMock()
+    increment_result = MagicMock()
+    increment_result.single.return_value = {"new_confidence": 4}  # 3 + 1
+    mock_session.run.return_value = increment_result
+
+    mock_graph_driver = MagicMock()
+    mock_graph_driver.session.return_value.__enter__.return_value = mock_session
+    mock_graphdb.driver.return_value = mock_graph_driver
+
+    from reflexion_core.memory_store import MemoryRepository
+
+    repo = MemoryRepository(agent_id="test_agent")
+    repo.collection = mock_collection
+    repo.graph = mock_graph_driver
+
+    repo.adjust_confidence(rule_id="rule_1", delta=1)
+
+    # First call must be the atomic increment query, not a precomputed SET
+    cypher_query = mock_session.run.call_args_list[0][0][0]
+    assert "r.confidence + $delta" in cypher_query
+    assert "RETURN" in cypher_query
+
+    # ChromaDB should sync to Neo4j's authoritative returned value (4)
+    mock_collection.update.assert_called_once()
+    updated_metadata = mock_collection.update.call_args.kwargs["metadatas"][0]
+    assert updated_metadata["confidence"] == 4
+
+
+@patch("reflexion_core.memory_store.GraphDatabase")
+@patch("reflexion_core.memory_store.embedding_functions")
+@patch("reflexion_core.memory_store.chromadb")
+def test_adjust_confidence_deletes_rule_when_confidence_hits_zero(
+    mock_chromadb, mock_embedding_functions, mock_graphdb
+):
+    """
+    When the atomic Neo4j increment drives confidence to 0 (or below), the
+    rule must be deleted from BOTH ChromaDB and Neo4j — not just decremented.
+    This path previously had zero test coverage despite being a real,
+    user-facing behavior (triggered by repeated /v1/reinforce failures).
+    """
+    mock_collection = MagicMock()
+    mock_collection.get.return_value = {
+        "ids": ["rule_1"],
+        "metadatas": [{"confidence": 1, "concept": "HTTP_REQUEST_BEST_PRACTICES"}],
+    }
+    mock_client = MagicMock()
+    mock_client.get_or_create_collection.return_value = mock_collection
+    mock_chromadb.PersistentClient.return_value = mock_client
+
+    mock_session = MagicMock()
+    increment_result = MagicMock()
+    increment_result.single.return_value = {"new_confidence": 0}  # 1 + (-1)
+    mock_session.run.return_value = increment_result
+
+    mock_graph_driver = MagicMock()
+    mock_graph_driver.session.return_value.__enter__.return_value = mock_session
+    mock_graphdb.driver.return_value = mock_graph_driver
+
+    from reflexion_core.memory_store import MemoryRepository
+
+    repo = MemoryRepository(agent_id="test_agent")
+    repo.collection = mock_collection
+    repo.graph = mock_graph_driver
+
+    repo.adjust_confidence(rule_id="rule_1", delta=-1)
+
+    # ChromaDB delete must be called — NOT update
+    mock_collection.delete.assert_called_once_with(ids=["rule_1"])
+    mock_collection.update.assert_not_called()
+
+    # Second Neo4j call (after the increment) must be the DETACH DELETE
+    delete_query = mock_session.run.call_args_list[1][0][0]
+    assert "DETACH DELETE" in delete_query
+
+
+@patch("reflexion_core.memory_store.GraphDatabase")
+@patch("reflexion_core.memory_store.embedding_functions")
+@patch("reflexion_core.memory_store.chromadb")
+def test_adjust_confidence_handles_missing_neo4j_rule_gracefully(
+    mock_chromadb, mock_embedding_functions, mock_graphdb
+):
+    """
+    Defensive guard: if a rule exists in ChromaDB but the Neo4j MATCH finds
+    nothing (e.g. the two stores drifted), adjust_confidence must return
+    cleanly instead of crashing on a None record.
+    """
+    mock_collection = MagicMock()
+    mock_collection.get.return_value = {
+        "ids": ["rule_orphaned"],
+        "metadatas": [{"confidence": 2, "concept": "SOME_CONCEPT"}],
+    }
+    mock_client = MagicMock()
+    mock_client.get_or_create_collection.return_value = mock_collection
+    mock_chromadb.PersistentClient.return_value = mock_client
+
+    mock_session = MagicMock()
+    empty_result = MagicMock()
+    empty_result.single.return_value = None  # no matching Neo4j node
+    mock_session.run.return_value = empty_result
+
+    mock_graph_driver = MagicMock()
+    mock_graph_driver.session.return_value.__enter__.return_value = mock_session
+    mock_graphdb.driver.return_value = mock_graph_driver
+
+    from reflexion_core.memory_store import MemoryRepository
+
+    repo = MemoryRepository(agent_id="test_agent")
+    repo.collection = mock_collection
+    repo.graph = mock_graph_driver
+
+    # Must not raise
+    repo.adjust_confidence(rule_id="rule_orphaned", delta=-1)
+
+    # No deletion or update should have happened in ChromaDB since we
+    # bailed out early on the missing Neo4j record
+    mock_collection.delete.assert_not_called()
+    mock_collection.update.assert_not_called()
