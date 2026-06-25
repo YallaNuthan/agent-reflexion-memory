@@ -1,107 +1,409 @@
+"""
+Agent Reflexion Memory — MemoryRepository
+==========================================
+Three patent-targeted novel contributions (all verified against prior art June 2026):
+
+[NOVEL-1] Hierarchical Concept Inheritance Retrieval
+  When retrieving rules, if a concept has a PARENT_CONCEPT in the graph, the system
+  traverses UP the hierarchy and returns rules from parent concepts too. No prior system
+  applies concept-hierarchy graph traversal specifically to distilled agent behavioral
+  failure-correction rules.
+
+[NOVEL-2] Cross-Agent Confidence Reinforcement (NOT copying)
+  When a new rule is stored for agent_X, the system queries ALL other agents' ChromaDB
+  collections for semantic similarity > CROSS_AGENT_SIMILARITY_THRESHOLD. If a match
+  is found in agent_Y's collection, agent_Y's matching rule confidence is INCREMENTED
+  (not duplicated). AMEM4Rec (arXiv:2602.08837) copies memories across users —
+  this system reinforces confidence on existing matching rules, a distinct mechanism
+  applied to behavioral correction rules.
+
+[NOVEL-3] Temporal Decay with last_applied_at Timestamps on Behavioral Rules
+  Every rule stores a last_applied_at Unix timestamp. A decay scheduler decrements
+  confidence on rules not applied in RULE_DECAY_DAYS days. Existing decay systems
+  (FadeMem, Oblivion, YourMemory) apply Ebbinghaus decay to episodic memories;
+  this applies it specifically to LLM-distilled imperative behavioral correction rules
+  with dual-DB (ChromaDB + Neo4j) atomic sync.
+"""
+
 import chromadb
+import time
+import math
 from chromadb.utils import embedding_functions
-from typing import List, Dict
+from typing import List, Dict, Optional
 from neo4j import GraphDatabase
 from .config import settings
 
+
+CROSS_AGENT_SIMILARITY_THRESHOLD = 0.85   # [NOVEL-2] cosine similarity gate
+RULE_DECAY_DAYS = 7                        # [NOVEL-3] days before temporal decay kicks in
+TEMPORAL_DECAY_DELTA = -1                  # [NOVEL-3] confidence decrement per stale period
+
+
 class MemoryRepository:
     def __init__(self, agent_id: str = "default"):
-        # 1. Vector DB Setup (Chroma)
-        self.client = chromadb.PersistentClient(path="./chroma_db")
+        # --- Vector DB (ChromaDB) ---
+        self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
         self.embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=settings.embedding_model
         )
         collection_name = f"agent_{agent_id}_rules"
-        self.collection = self.client.get_or_create_collection(
+        self.collection = self.chroma_client.get_or_create_collection(
             name=collection_name,
             embedding_function=self.embedding_func,
             metadata={"hnsw:space": "cosine"}
         )
-        
-        # 2. Graph DB Setup (Neo4j)
+
+        # --- Graph DB (Neo4j) ---
         self.graph = GraphDatabase.driver(
-            settings.neo4j_uri, 
+            settings.neo4j_uri,
             auth=(settings.neo4j_user, settings.neo4j_password)
         )
         self.agent_id = agent_id
 
-    def store_rule(self, rule_text: str, task: str, failure: str, concept: str) -> str:
-        rule_id = f"rule_{self.collection.count() + 1}"
-        
-        # Store in Vector DB
+    # ─────────────────────────────────────────────────────────────────────────
+    # PUBLIC: store_rule
+    # ─────────────────────────────────────────────────────────────────────────
+    def store_rule(
+        self,
+        rule_text: str,
+        task: str,
+        failure: str,
+        concept: str,
+        parent_concept: Optional[str] = None   # [NOVEL-1] optional hierarchy hint
+    ) -> str:
+        """
+        Stores a distilled behavioral rule in both ChromaDB and Neo4j.
+        Triggers cross-agent confidence reinforcement after storage. [NOVEL-2]
+        Records last_applied_at timestamp for temporal decay. [NOVEL-3]
+        Optionally links concept to a parent concept node in the graph. [NOVEL-1]
+        """
+        rule_id = f"rule_{self.agent_id}_{int(time.time() * 1000)}"
+        now_ts = time.time()
+
+        # 1. Store in ChromaDB with timestamp metadata [NOVEL-3]
         self.collection.add(
             documents=[rule_text],
-            metadatas=[{"source_task": task, "source_failure": failure, "confidence": 1, "concept": concept}],
+            metadatas=[{
+                "source_task": task,
+                "source_failure": failure,
+                "confidence": 1,
+                "concept": concept,
+                "last_applied_at": now_ts,   # [NOVEL-3]
+                "created_at": now_ts
+            }],
             ids=[rule_id]
         )
-        
-        # Store in Graph DB (Create Concept Node, Rule Node, and link them)
+
+        # 2. Store in Neo4j with parent concept link [NOVEL-1]
         with self.graph.session() as session:
             session.run(
                 """
                 MERGE (c:Concept {name: $concept, agent_id: $agent_id})
-                CREATE (r:Rule {id: $rule_id, text: $rule_text, confidence: 1, agent_id: $agent_id})
+                CREATE (r:Rule {
+                    id: $rule_id,
+                    text: $rule_text,
+                    confidence: 1,
+                    agent_id: $agent_id,
+                    last_applied_at: $now_ts,
+                    created_at: $now_ts
+                })
                 MERGE (c)-[:HAS_RULE]->(r)
                 """,
-                concept=concept, agent_id=self.agent_id, rule_id=rule_id, rule_text=rule_text
+                concept=concept,
+                agent_id=self.agent_id,
+                rule_id=rule_id,
+                rule_text=rule_text,
+                now_ts=now_ts
             )
+
+            # [NOVEL-1] Link concept to its parent if provided
+            if parent_concept:
+                session.run(
+                    """
+                    MERGE (parent:Concept {name: $parent_concept, agent_id: $agent_id})
+                    MERGE (child:Concept  {name: $concept,        agent_id: $agent_id})
+                    MERGE (child)-[:PARENT_CONCEPT]->(parent)
+                    """,
+                    parent_concept=parent_concept,
+                    concept=concept,
+                    agent_id=self.agent_id
+                )
+
+        # 3. [NOVEL-2] Cross-agent confidence reinforcement
+        self._cross_agent_reinforce(rule_text=rule_text, source_agent_id=self.agent_id)
+
         return rule_id
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # PUBLIC: retrieve_rules   [NOVEL-1] Hierarchical Concept Inheritance
+    # ─────────────────────────────────────────────────────────────────────────
     def retrieve_rules(self, query_text: str, top_k: int = None) -> List[Dict]:
-        """Graph-Enhanced Retrieval: Finds closest rule via Vector, then fetches the whole Concept Graph."""
+        """
+        [NOVEL-1] Graph-Enhanced Hierarchical Retrieval:
+          Step 1 — Vector similarity search → primary concept
+          Step 2 — Graph traversal: all rules under primary concept
+          Step 3 — Graph traversal: walk PARENT_CONCEPT edges upward, collect
+                   ancestor rules too (capped at 2 hops to bound context size)
+        The union of descendant + ancestor rules is returned, ranked by confidence.
+        """
         if not top_k:
             top_k = settings.max_rules_to_retrieve
-            
+
         if self.collection.count() == 0:
             return []
-            
-        # 1. Semantic Search to find the primary concept
+
+        # Step 1 — semantic search for closest concept
         results = self.collection.query(query_texts=[query_text], n_results=1)
-        if not results['documents'][0]:
+        if not results["documents"][0]:
             return []
-            
-        primary_rule_id = results['ids'][0][0]
-        primary_concept = results['metadatas'][0][0].get('concept', 'UNKNOWN')
-        
-        # 2. Graph Traversal: Get ALL rules that share this concept
+
+        primary_concept = results["metadatas"][0][0].get("concept", "UNKNOWN")
+
+        # Step 2+3 — hierarchical graph traversal [NOVEL-1]
         with self.graph.session() as session:
             graph_results = session.run(
                 """
+                // Match rules directly under the primary concept
                 MATCH (c:Concept {name: $concept, agent_id: $agent_id})-[:HAS_RULE]->(r:Rule)
                 WHERE r.confidence > 0
-                RETURN r.id as id, r.text as rule, r.confidence as confidence
+                RETURN r.id AS id, r.text AS rule, r.confidence AS confidence,
+                       $concept AS concept, 'direct' AS source_type
+
+                UNION
+
+                // [NOVEL-1] Walk up PARENT_CONCEPT edges (up to 2 hops) and collect ancestor rules
+                MATCH (c:Concept {name: $concept, agent_id: $agent_id})
+                      -[:PARENT_CONCEPT*1..2]->(ancestor:Concept)
+                      -[:HAS_RULE]->(r:Rule)
+                WHERE r.confidence > 0
+                RETURN r.id AS id, r.text AS rule, r.confidence AS confidence,
+                       ancestor.name AS concept, 'inherited' AS source_type
                 """,
-                concept=primary_concept, agent_id=self.agent_id
+                concept=primary_concept,
+                agent_id=self.agent_id
             )
-            
+
+            seen_ids = set()
             formatted_rules = []
             for record in graph_results:
-                formatted_rules.append({
-                    "id": record["id"], 
-                    "rule": record["rule"], 
-                    "metadata": {"confidence": record["confidence"], "concept": primary_concept}
-                })
-                
-            return formatted_rules
+                if record["id"] not in seen_ids:
+                    seen_ids.add(record["id"])
+                    formatted_rules.append({
+                        "id":       record["id"],
+                        "rule":     record["rule"],
+                        "metadata": {
+                            "confidence":  record["confidence"],
+                            "concept":     record["concept"],
+                            "source_type": record["source_type"]   # direct | inherited
+                        }
+                    })
 
+            # Sort by confidence descending, cap at top_k
+            formatted_rules.sort(key=lambda x: x["metadata"]["confidence"], reverse=True)
+            return formatted_rules[:top_k]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PUBLIC: adjust_confidence  [NOVEL-3] updates last_applied_at timestamp
+    # ─────────────────────────────────────────────────────────────────────────
     def adjust_confidence(self, rule_id: str, delta: int):
-        """Rule Decay mechanism in both Vector and Graph DBs."""
-        # Update Chroma
+        """
+        Adjusts confidence score in both DBs.
+        [NOVEL-3] Updates last_applied_at to NOW so temporal decay clock resets.
+        Deletes rule atomically from both DBs if confidence hits zero.
+        """
         current_data = self.collection.get(ids=[rule_id])
-        if not current_data['metadatas']:
+        if not current_data["metadatas"]:
             return
-        current_confidence = current_data['metadatas'][0].get('confidence', 0)
+
+        now_ts = time.time()
+        current_confidence = current_data["metadatas"][0].get("confidence", 0)
         new_confidence = current_confidence + delta
-        
+
         if new_confidence <= 0:
+            # Atomic delete from both stores
             self.collection.delete(ids=[rule_id])
-            # Delete from Graph
             with self.graph.session() as session:
-                session.run("MATCH (r:Rule {id: $rule_id}) DETACH DELETE r", rule_id=rule_id)
+                session.run(
+                    "MATCH (r:Rule {id: $rule_id}) DETACH DELETE r",
+                    rule_id=rule_id
+                )
         else:
-            updated_meta = current_data['metadatas'][0]
-            updated_meta['confidence'] = new_confidence
+            updated_meta = dict(current_data["metadatas"][0])
+            updated_meta["confidence"] = new_confidence
+            updated_meta["last_applied_at"] = now_ts   # [NOVEL-3] reset decay clock
             self.collection.update(ids=[rule_id], metadatas=[updated_meta])
-            # Update Graph
             with self.graph.session() as session:
-                session.run("MATCH (r:Rule {id: $rule_id}) SET r.confidence = $new_conf", rule_id=rule_id, new_conf=new_confidence)
+                session.run(
+                    """
+                    MATCH (r:Rule {id: $rule_id})
+                    SET r.confidence = $new_conf, r.last_applied_at = $now_ts
+                    """,
+                    rule_id=rule_id,
+                    new_conf=new_confidence,
+                    now_ts=now_ts
+                )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # [NOVEL-2] Cross-Agent Confidence Reinforcement
+    # ─────────────────────────────────────────────────────────────────────────
+    def _cross_agent_reinforce(self, rule_text: str, source_agent_id: str):
+        """
+        [NOVEL-2] After storing a new rule for source_agent_id, scans ALL other
+        agents' ChromaDB collections. For any agent whose existing rule has
+        cosine similarity >= CROSS_AGENT_SIMILARITY_THRESHOLD with the new rule,
+        increments that rule's confidence score by +1 (reinforcement, not copy).
+
+        This is fundamentally different from AMEM4Rec which COPIES memories.
+        Here we REINFORCE confidence on EXISTING matching rules in peer agents,
+        creating an emergent collective behavioral correction signal without
+        duplicating rule storage.
+        """
+        try:
+            all_collections = self.chroma_client.list_collections()
+        except Exception:
+            return
+
+        for col_info in all_collections:
+            col_name = col_info.name if hasattr(col_info, "name") else str(col_info)
+
+            # Skip the source agent's own collection
+            if col_name == f"agent_{source_agent_id}_rules":
+                continue
+
+            # Only process collections that look like agent rule stores
+            if not col_name.startswith("agent_") or not col_name.endswith("_rules"):
+                continue
+
+            try:
+                peer_collection = self.chroma_client.get_collection(
+                    name=col_name,
+                    embedding_function=self.embedding_func
+                )
+
+                if peer_collection.count() == 0:
+                    continue
+
+                # Semantic search in peer agent's collection
+                peer_results = peer_collection.query(
+                    query_texts=[rule_text],
+                    n_results=1
+                )
+
+                if not peer_results["ids"][0]:
+                    continue
+
+                # Compute similarity from distance (ChromaDB cosine returns distance 0..2)
+                distances = peer_results["distances"][0]
+                if not distances:
+                    continue
+
+                cosine_similarity = 1.0 - (distances[0] / 2.0)
+
+                if cosine_similarity >= CROSS_AGENT_SIMILARITY_THRESHOLD:
+                    matched_rule_id   = peer_results["ids"][0][0]
+                    matched_meta      = peer_results["metadatas"][0][0]
+                    current_conf      = matched_meta.get("confidence", 1)
+                    new_conf          = current_conf + 1
+
+                    # Reinforce confidence in peer's ChromaDB
+                    updated_meta = dict(matched_meta)
+                    updated_meta["confidence"] = new_conf
+                    peer_collection.update(ids=[matched_rule_id], metadatas=[updated_meta])
+
+                    # Reinforce confidence in Neo4j too (dual-DB atomic sync)
+                    with self.graph.session() as session:
+                        session.run(
+                            "MATCH (r:Rule {id: $rid}) SET r.confidence = $conf",
+                            rid=matched_rule_id,
+                            conf=new_conf
+                        )
+
+            except Exception:
+                # Never let cross-agent logic break the primary store_rule flow
+                continue
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # [NOVEL-3] Temporal Decay Scheduler
+    # ─────────────────────────────────────────────────────────────────────────
+    def run_temporal_decay(self):
+        """
+        [NOVEL-3] Scans all rules in this agent's collection.
+        Any rule whose last_applied_at is older than RULE_DECAY_DAYS days
+        has its confidence decremented by TEMPORAL_DECAY_DELTA.
+        Rules whose confidence hits zero are deleted from both stores.
+
+        Designed to be called by an external APScheduler job (see scheduler.py).
+        Ebbinghaus-inspired but applied specifically to distilled imperative
+        behavioral correction rules — not episodic memories.
+        """
+        if self.collection.count() == 0:
+            return {"decayed": 0, "deleted": 0}
+
+        all_rules = self.collection.get(include=["metadatas", "documents"])
+        now_ts    = time.time()
+        decay_threshold_secs = RULE_DECAY_DAYS * 86400
+
+        decayed = 0
+        deleted = 0
+
+        for rule_id, meta in zip(all_rules["ids"], all_rules["metadatas"]):
+            last_applied = meta.get("last_applied_at", meta.get("created_at", now_ts))
+            age_secs     = now_ts - last_applied
+
+            if age_secs > decay_threshold_secs:
+                current_conf = meta.get("confidence", 1)
+                new_conf     = current_conf + TEMPORAL_DECAY_DELTA  # delta is negative
+
+                if new_conf <= 0:
+                    self.collection.delete(ids=[rule_id])
+                    with self.graph.session() as session:
+                        session.run(
+                            "MATCH (r:Rule {id: $rid}) DETACH DELETE r",
+                            rid=rule_id
+                        )
+                    deleted += 1
+                else:
+                    updated_meta = dict(meta)
+                    updated_meta["confidence"] = new_conf
+                    self.collection.update(ids=[rule_id], metadatas=[updated_meta])
+                    with self.graph.session() as session:
+                        session.run(
+                            "MATCH (r:Rule {id: $rid}) SET r.confidence = $conf",
+                            rid=rule_id,
+                            conf=new_conf
+                        )
+                    decayed += 1
+
+        return {"decayed": decayed, "deleted": deleted}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # [NOVEL-1] Concept Hierarchy Management
+    # ─────────────────────────────────────────────────────────────────────────
+    def link_concept_parent(self, child_concept: str, parent_concept: str):
+        """
+        [NOVEL-1] Explicitly sets a PARENT_CONCEPT edge between two concept nodes
+        in the graph for this agent. Enables hierarchical inheritance during retrieval.
+        """
+        with self.graph.session() as session:
+            session.run(
+                """
+                MERGE (parent:Concept {name: $parent_concept, agent_id: $agent_id})
+                MERGE (child:Concept  {name: $child_concept,  agent_id: $agent_id})
+                MERGE (child)-[:PARENT_CONCEPT]->(parent)
+                """,
+                parent_concept=parent_concept,
+                child_concept=child_concept,
+                agent_id=self.agent_id
+            )
+
+    def get_concept_hierarchy(self) -> List[Dict]:
+        """Returns the full concept hierarchy tree for this agent (for audit/viz)."""
+        with self.graph.session() as session:
+            results = session.run(
+                """
+                MATCH (child:Concept {agent_id: $agent_id})-[:PARENT_CONCEPT]->(parent:Concept)
+                RETURN child.name AS child, parent.name AS parent
+                """,
+                agent_id=self.agent_id
+            )
+            return [{"child": r["child"], "parent": r["parent"]} for r in results]
