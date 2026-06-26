@@ -1,7 +1,7 @@
 """
 Agent Reflexion Memory — MemoryRepository
 ==========================================
-Three patent-targeted novel contributions (all verified against prior art June 2026):
+Four patent-targeted novel contributions (all verified against prior art June 2026):
 
 [NOVEL-1] Hierarchical Concept Inheritance Retrieval
   When retrieving rules, if a concept has a PARENT_CONCEPT in the graph, the system
@@ -23,6 +23,14 @@ Three patent-targeted novel contributions (all verified against prior art June 2
   (FadeMem, Oblivion, YourMemory) apply Ebbinghaus decay to episodic memories;
   this applies it specifically to LLM-distilled imperative behavioral correction rules
   with dual-DB (ChromaDB + Neo4j) atomic sync.
+
+[NOVEL-4] Multi-Agent Consensus Gate
+  Distilled rules wait in a PENDING collection until N independent agents converge
+  on a semantically similar rule. Only then is the rule promoted to permanent
+  storage, with initial confidence equal to the consensus count. This prevents a
+  single agent's idiosyncratic or noisy failure from permanently polluting the
+  shared behavioral rule store — permanence is gated on independent multi-agent
+  agreement, not on a single distillation event.
 """
 
 import chromadb
@@ -61,6 +69,16 @@ class MemoryRepository:
         )
         self.agent_id = agent_id
 
+        # --- [NOVEL-4] Pending Rules Collection (Consensus Gate) ---
+        # Rules wait here until N agents independently distill the same rule.
+        # Only then does the rule graduate to permanent storage.
+        pending_collection_name = f"agent_{agent_id}_pending_rules"
+        self.pending_collection = self.chroma_client.get_or_create_collection(
+            name=pending_collection_name,
+            embedding_function=self.embedding_func,
+            metadata={"hnsw:space": "cosine"}
+        )
+
     # ─────────────────────────────────────────────────────────────────────────
     # PUBLIC: store_rule
     # ─────────────────────────────────────────────────────────────────────────
@@ -70,13 +88,17 @@ class MemoryRepository:
         task: str,
         failure: str,
         concept: str,
-        parent_concept: Optional[str] = None   # [NOVEL-1] optional hierarchy hint
+        parent_concept: Optional[str] = None,  # [NOVEL-1] optional hierarchy hint
+        initial_confidence: int = 1             # [NOVEL-4] consensus gate sets this to N
     ) -> str:
         """
         Stores a distilled behavioral rule in both ChromaDB and Neo4j.
         Triggers cross-agent confidence reinforcement after storage. [NOVEL-2]
         Records last_applied_at timestamp for temporal decay. [NOVEL-3]
         Optionally links concept to a parent concept node in the graph. [NOVEL-1]
+        initial_confidence defaults to 1 for direct storage, but the consensus
+        gate (NOVEL-4) calls this with initial_confidence = N when promoting a
+        rule that N independent agents converged on.
         """
         rule_id = f"rule_{self.agent_id}_{int(time.time() * 1000)}"
         now_ts = time.time()
@@ -87,7 +109,7 @@ class MemoryRepository:
             metadatas=[{
                 "source_task": task,
                 "source_failure": failure,
-                "confidence": 1,
+                "confidence": initial_confidence,
                 "concept": concept,
                 "last_applied_at": now_ts,   # [NOVEL-3]
                 "created_at": now_ts
@@ -103,7 +125,7 @@ class MemoryRepository:
                 CREATE (r:Rule {
                     id: $rule_id,
                     text: $rule_text,
-                    confidence: 1,
+                    confidence: $initial_confidence,
                     agent_id: $agent_id,
                     last_applied_at: $now_ts,
                     created_at: $now_ts
@@ -114,7 +136,8 @@ class MemoryRepository:
                 agent_id=self.agent_id,
                 rule_id=rule_id,
                 rule_text=rule_text,
-                now_ts=now_ts
+                now_ts=now_ts,
+                initial_confidence=initial_confidence
             )
 
             # [NOVEL-1] Link concept to its parent if provided
@@ -295,7 +318,10 @@ class MemoryRepository:
                 continue
 
             # Only process collections that look like agent rule stores
+            # (excludes pending-rule collections, which use a different suffix)
             if not col_name.startswith("agent_") or not col_name.endswith("_rules"):
+                continue
+            if col_name.endswith("_pending_rules"):
                 continue
 
             try:
@@ -425,7 +451,158 @@ class MemoryRepository:
             # If a rule in this batch was deleted, the collection shrank, so the
             # next "page" at the same offset now contains what used to be after
             # it — advancing offset by the batch's original size still correctly
-            # walks the whole collection
+            # walks the whole collection without skipping or reprocessing rows
+            # in the common case (deletions are the minority within a batch).
+            offset += batch_size
+
+        return {"decayed": decayed, "deleted": deleted}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # [NOVEL-4] Multi-Agent Consensus Gate
+    # ─────────────────────────────────────────────────────────────────────────
+    def store_pending_rule(
+        self,
+        rule_text: str,
+        task: str,
+        failure: str,
+        concept: str,
+        parent_concept: Optional[str] = None
+    ) -> str:
+        """
+        [NOVEL-4] Stores a distilled rule in the PENDING collection rather than
+        permanent storage. The rule waits here until promote_pending_rules()
+        confirms that N independent agents have distilled semantically similar
+        rules — at which point it graduates to permanent storage with
+        initial_confidence = N (consensus_confidence).
+
+        This prevents one-off agent failures from permanently polluting the
+        behavioral rule store — a rule is only promoted when multiple agents
+        independently converge on the same corrective behavior.
+        """
+        rule_id = f"pending_{self.agent_id}_{int(time.time() * 1000)}"
+        now_ts  = time.time()
+        self.pending_collection.add(
+            documents=[rule_text],
+            metadatas=[{
+                "source_task":    task,
+                "source_failure": failure,
+                "concept":        concept,
+                "parent_concept": parent_concept or "",
+                "created_at":     now_ts,
+                "agent_id":       self.agent_id
+            }],
+            ids=[rule_id]
+        )
+        return rule_id
+
+    def promote_pending_rules(self, consensus_threshold: int = 2) -> dict:
+        """
+        [NOVEL-4] Consensus Gate promotion:
+          1. For each rule in this agent's pending collection, scan ALL other
+             agents' pending collections for semantically similar rules
+             (cosine similarity >= CROSS_AGENT_SIMILARITY_THRESHOLD).
+          2. Count how many distinct agents (including this one) have
+             independently distilled a matching pending rule.
+          3. If the count >= consensus_threshold, promote the rule to permanent
+             storage with initial_confidence = count (consensus_confidence).
+             Delete the promoted rule from all participating pending collections.
+          4. Rules below threshold remain pending.
+
+        Unlike AMEM4Rec which copies memories globally, this mechanism requires
+        independent convergence from N separate agents before any rule becomes
+        permanent — reducing false-positive rule storage from isolated failures.
+        """
+        if self.pending_collection.count() == 0:
+            return {"promoted": 0, "still_pending": 0, "consensus_threshold": consensus_threshold}
+
+        promoted      = 0
+        still_pending = 0
+
+        pending_all = self.pending_collection.get(include=["metadatas", "documents"])
+
+        for rule_id, rule_text, meta in zip(
+            pending_all["ids"],
+            pending_all["documents"],
+            pending_all["metadatas"]
+        ):
+            # Start with this agent as one vote
+            matching_agents: List[str] = [self.agent_id]
+            matching_peer_rule_ids: List[tuple] = []  # (col_name, rule_id)
+
+            try:
+                all_collections = self.chroma_client.list_collections()
+            except Exception:
+                still_pending += 1
+                continue
+
+            for col_info in all_collections:
+                col_name = col_info.name if hasattr(col_info, "name") else str(col_info)
+
+                # Only scan OTHER agents' pending collections
+                if col_name == f"agent_{self.agent_id}_pending_rules":
+                    continue
+                if not col_name.startswith("agent_") or not col_name.endswith("_pending_rules"):
+                    continue
+
+                try:
+                    peer_pending = self.chroma_client.get_collection(
+                        name=col_name,
+                        embedding_function=self.embedding_func
+                    )
+                    if peer_pending.count() == 0:
+                        continue
+
+                    peer_results = peer_pending.query(query_texts=[rule_text], n_results=1)
+                    if not peer_results["ids"][0]:
+                        continue
+
+                    dist       = peer_results["distances"][0][0]
+                    similarity = 1.0 - (dist / 2.0)
+
+                    if similarity >= CROSS_AGENT_SIMILARITY_THRESHOLD:
+                        peer_agent_id = col_name[len("agent_"):-len("_pending_rules")]
+                        matching_agents.append(peer_agent_id)
+                        matching_peer_rule_ids.append((col_name, peer_results["ids"][0][0]))
+
+                except Exception:
+                    continue
+
+            if len(matching_agents) >= consensus_threshold:
+                # Graduate to permanent storage — confidence starts at N (consensus signal)
+                consensus_confidence = len(matching_agents)
+                self.store_rule(
+                    rule_text=rule_text,
+                    task=meta.get("source_task", ""),
+                    failure=meta.get("source_failure", ""),
+                    concept=meta.get("concept", "GENERAL_RULE"),
+                    parent_concept=meta.get("parent_concept") or None,
+                    initial_confidence=consensus_confidence
+                )
+
+                # Remove from this agent's pending store
+                self.pending_collection.delete(ids=[rule_id])
+
+                # Remove from peer agents' pending stores
+                for peer_col_name, peer_rule_id in matching_peer_rule_ids:
+                    try:
+                        peer_col = self.chroma_client.get_collection(
+                            name=peer_col_name,
+                            embedding_function=self.embedding_func
+                        )
+                        peer_col.delete(ids=[peer_rule_id])
+                    except Exception:
+                        continue
+
+                promoted += 1
+            else:
+                still_pending += 1
+
+        return {
+            "promoted":            promoted,
+            "still_pending":       still_pending,
+            "consensus_threshold": consensus_threshold
+        }
+
     # ─────────────────────────────────────────────────────────────────────────
     # [NOVEL-1] Concept Hierarchy Management
     # ─────────────────────────────────────────────────────────────────────────
@@ -484,4 +661,3 @@ class MemoryRepository:
                 agent_id=self.agent_id
             )
             return [{"child": r["child"], "parent": r["parent"]} for r in results]
-        
